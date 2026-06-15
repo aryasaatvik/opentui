@@ -73,7 +73,6 @@ export class NativeSpanFeed {
   // a bigint for node:ffi) and as struct fields read by bun-ffi-structs (a bigint at 8-byte
   // pointer width, except a number under Bun). Normalize every key to bigint so lookups match
   // regardless of which path produced the pointer.
-  private chunkMap = new Map<bigint, ArrayBuffer>()
   private chunkSizes = new Map<bigint, number>()
   private dataHandlers = new Set<DataHandler>()
   private errorHandlers = new Set<(code: number) => void>()
@@ -176,7 +175,6 @@ export class NativeSpanFeed {
     this.lib.unregisterNativeSpanFeedStream(this.streamPtr)
     this.lib.destroyNativeSpanFeed(this.streamPtr)
     this.destroyed = true
-    this.chunkMap.clear()
     this.chunkSizes.clear()
     this.stateBuffer = null
     this.drainBuffer = null
@@ -235,14 +233,10 @@ export class NativeSpanFeed {
         }
         case EventId.ChunkAdded: {
           const chunkLen = toNumber(arg1)
-          if (chunkLen > 0 && arg0) {
-            const key = chunkKey(arg0)
-            if (!this.chunkMap.has(key)) {
-              const buffer = toArrayBuffer(arg0, 0, chunkLen)
-              this.chunkMap.set(key, buffer)
-            }
-            this.chunkSizes.set(key, chunkLen)
-          }
+          // Only the size is consumed downstream; processSpans reads each chunk's bytes via
+          // toArrayBuffer on demand. Don't cache the buffer here — on the WASM backend that's a full
+          // copy per ChunkAdded, which would grow the heap unboundedly in a long-lived renderer.
+          if (chunkLen > 0 && arg0) this.chunkSizes.set(chunkKey(arg0), chunkLen)
           break
         }
         case EventId.Error: {

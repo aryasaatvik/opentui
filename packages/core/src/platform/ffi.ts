@@ -206,6 +206,7 @@ let wasmMode = false
 export function setFfiBackend(backend: FfiBackend, opts?: { wasm?: boolean }): void {
   currentBackend = backend
   wasmMode = opts?.wasm ?? false
+  suffix = backend.suffix
 }
 
 // An opaque handle to whichever backend is active right now. A RenderLib captures this at
@@ -220,6 +221,7 @@ export function captureBackend(): BackendHandle {
 export function activateBackend(handle: BackendHandle): void {
   currentBackend = handle.backend
   wasmMode = handle.wasm
+  suffix = handle.backend.suffix
 }
 
 // True when a WASM backend is active. Call sites that pack structs with nested `char*` data (whose
@@ -703,7 +705,9 @@ export function dlopen<Fns extends Record<string, FFIFunction>>(path: string | U
 export function ptr(value: PointerSource): Pointer {
   return currentBackend.ptr(value)
 }
-export const suffix = currentBackend.suffix
+// A live binding (not a frozen const): kept in sync with the active backend by setFfiBackend /
+// activateBackend, so it matches the forwarding dlopen/ptr/toArrayBuffer exports above.
+export let suffix = currentBackend.suffix
 export function toArrayBuffer(pointer: Pointer, offset: number | undefined, length: number): ArrayBuffer {
   return currentBackend.toArrayBuffer(pointer, offset, length)
 }

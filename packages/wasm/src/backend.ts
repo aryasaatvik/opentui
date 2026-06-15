@@ -88,8 +88,15 @@ export function createWasmBackend(): WasmFfi {
       const fn = (rt.exports as Record<string, (...a: any[]) => any>)[name]
       if (typeof fn !== "function") throw new Error(`opentui.wasm export not found: ${name}`)
       if (DEBUG) console.error(`-> ${name}`)
-      const result = fn(...wargs)
-      flushPending()
+      // flushPending() copies out-params back to their JS views and frees the linear-memory regions.
+      // It MUST run even if the export throws, or the pending regions leak and a later flush would
+      // copy back / double-free addresses the allocator may have since reused.
+      let result: any
+      try {
+        result = fn(...wargs)
+      } finally {
+        flushPending()
+      }
       if (ret === "bool") return result !== 0
       return result
     }

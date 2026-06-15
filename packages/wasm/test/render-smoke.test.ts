@@ -31,7 +31,7 @@ test("opentui.wasm renders one frame to ANSI bytes through a NativeSpanFeed", as
   const status = x.render(renderer, true)
   expect(status).not.toBe(2) // 0=rendered, 1=skipped(backpressure), 2=failed
 
-  // Drain ANSI spans from the feed (SpanInfo is 20 bytes: chunk_ptr,offset,len,chunk_index,reserved).
+  // Drain ANSI spans from the feed (SpanInfo is 24 bytes: u64 chunk_ptr + 4×u32).
   const MAX_SPANS = 128
   const SPAN_SIZE = 24 // SpanInfo: u64 chunk_ptr + 4×u32
   const outPtr = rt.alloc(MAX_SPANS * SPAN_SIZE)
