@@ -3,9 +3,15 @@
 // Last generated: 2026-05-05T07:27:08.000Z
 
 import type { FiletypeParserOptions } from "./types.js"
-import { resolveBundledFilePath } from "../../platform/runtime.js"
 
-// Cached parsers to avoid re-resolving paths on every call
+// `new URL(rel, import.meta.url)` is the portable asset-reference primitive: every bundler
+// (Vite/rolldown, Bun, esbuild, webpack) emits the referenced file and rewrites the URL instead of
+// parsing it as a JS module — so the .scm query files and grammar .wasm stay bundler-portable. In a
+// native runtime it resolves to a file:// URL the parser worker reads; in a browser/worker bundle it
+// resolves to an emitted asset URL the worker fetches.
+const asset = (rel: string): string => new URL(rel, import.meta.url).href
+
+// Cached parsers to avoid re-resolving on every call
 let _cachedParsers: Promise<FiletypeParserOptions[]> | undefined
 
 export function getParsers(): Promise<FiletypeParserOptions[]> {
@@ -16,118 +22,62 @@ export function getParsers(): Promise<FiletypeParserOptions[]> {
 }
 
 async function loadParsers(): Promise<FiletypeParserOptions[]> {
-  const javascript_highlights = await resolveBundledFilePath(
-    () => import("./assets/javascript/highlights.scm" as string, { with: { type: "file" } }),
-    "./assets/javascript/highlights.scm",
-    import.meta.url,
-  )
-  const javascript_language = await resolveBundledFilePath(
-    () => import("./assets/javascript/tree-sitter-javascript.wasm" as string, { with: { type: "file" } }),
-    "./assets/javascript/tree-sitter-javascript.wasm",
-    import.meta.url,
-  )
-  const typescript_highlights = await resolveBundledFilePath(
-    () => import("./assets/typescript/highlights.scm" as string, { with: { type: "file" } }),
-    "./assets/typescript/highlights.scm",
-    import.meta.url,
-  )
-  const typescript_language = await resolveBundledFilePath(
-    () => import("./assets/typescript/tree-sitter-typescript.wasm" as string, { with: { type: "file" } }),
-    "./assets/typescript/tree-sitter-typescript.wasm",
-    import.meta.url,
-  )
-  const markdown_highlights = await resolveBundledFilePath(
-    () => import("./assets/markdown/highlights.scm" as string, { with: { type: "file" } }),
-    "./assets/markdown/highlights.scm",
-    import.meta.url,
-  )
-  const markdown_language = await resolveBundledFilePath(
-    () => import("./assets/markdown/tree-sitter-markdown.wasm" as string, { with: { type: "file" } }),
-    "./assets/markdown/tree-sitter-markdown.wasm",
-    import.meta.url,
-  )
-  const markdown_injections = await resolveBundledFilePath(
-    () => import("./assets/markdown/injections.scm" as string, { with: { type: "file" } }),
-    "./assets/markdown/injections.scm",
-    import.meta.url,
-  )
-  const markdown_inline_highlights = await resolveBundledFilePath(
-    () => import("./assets/markdown_inline/highlights.scm" as string, { with: { type: "file" } }),
-    "./assets/markdown_inline/highlights.scm",
-    import.meta.url,
-  )
-  const markdown_inline_language = await resolveBundledFilePath(
-    () => import("./assets/markdown_inline/tree-sitter-markdown_inline.wasm" as string, { with: { type: "file" } }),
-    "./assets/markdown_inline/tree-sitter-markdown_inline.wasm",
-    import.meta.url,
-  )
-  const zig_highlights = await resolveBundledFilePath(
-    () => import("./assets/zig/highlights.scm" as string, { with: { type: "file" } }),
-    "./assets/zig/highlights.scm",
-    import.meta.url,
-  )
-  const zig_language = await resolveBundledFilePath(
-    () => import("./assets/zig/tree-sitter-zig.wasm" as string, { with: { type: "file" } }),
-    "./assets/zig/tree-sitter-zig.wasm",
-    import.meta.url,
-  )
-
   return [
-      {
-        filetype: "javascript",
-        aliases: ["javascriptreact"],
-        queries: {
-          highlights: [javascript_highlights],
-        },
-        wasm: javascript_language,
+    {
+      filetype: "javascript",
+      aliases: ["javascriptreact"],
+      queries: {
+        highlights: [asset("./assets/javascript/highlights.scm")],
       },
-      {
-        filetype: "typescript",
-        aliases: ["typescriptreact"],
-        queries: {
-          highlights: [typescript_highlights],
-        },
-        wasm: typescript_language,
+      wasm: asset("./assets/javascript/tree-sitter-javascript.wasm"),
+    },
+    {
+      filetype: "typescript",
+      aliases: ["typescriptreact"],
+      queries: {
+        highlights: [asset("./assets/typescript/highlights.scm")],
       },
-      {
-        filetype: "markdown",
-        queries: {
-          highlights: [markdown_highlights],
-          injections: [markdown_injections],
-        },
-        wasm: markdown_language,
-        injectionMapping: {
-          "nodeTypes": {
-                    "inline": "markdown_inline",
-                    "pipe_table_cell": "markdown_inline"
-          },
-          "infoStringMap": {
-                    "javascript": "javascript",
-                    "js": "javascript",
-                    "jsx": "javascriptreact",
-                    "javascriptreact": "javascriptreact",
-                    "typescript": "typescript",
-                    "ts": "typescript",
-                    "tsx": "typescriptreact",
-                    "typescriptreact": "typescriptreact",
-                    "markdown": "markdown",
-                    "md": "markdown"
-          }
-},
+      wasm: asset("./assets/typescript/tree-sitter-typescript.wasm"),
+    },
+    {
+      filetype: "markdown",
+      queries: {
+        highlights: [asset("./assets/markdown/highlights.scm")],
+        injections: [asset("./assets/markdown/injections.scm")],
       },
-      {
-        filetype: "markdown_inline",
-        queries: {
-          highlights: [markdown_inline_highlights],
+      wasm: asset("./assets/markdown/tree-sitter-markdown.wasm"),
+      injectionMapping: {
+        nodeTypes: {
+          inline: "markdown_inline",
+          pipe_table_cell: "markdown_inline",
         },
-        wasm: markdown_inline_language,
-      },
-      {
-        filetype: "zig",
-        queries: {
-          highlights: [zig_highlights],
+        infoStringMap: {
+          javascript: "javascript",
+          js: "javascript",
+          jsx: "javascriptreact",
+          javascriptreact: "javascriptreact",
+          typescript: "typescript",
+          ts: "typescript",
+          tsx: "typescriptreact",
+          typescriptreact: "typescriptreact",
+          markdown: "markdown",
+          md: "markdown",
         },
-        wasm: zig_language,
       },
-    ]
+    },
+    {
+      filetype: "markdown_inline",
+      queries: {
+        highlights: [asset("./assets/markdown_inline/highlights.scm")],
+      },
+      wasm: asset("./assets/markdown_inline/tree-sitter-markdown_inline.wasm"),
+    },
+    {
+      filetype: "zig",
+      queries: {
+        highlights: [asset("./assets/zig/highlights.scm")],
+      },
+      wasm: asset("./assets/zig/tree-sitter-zig.wasm"),
+    },
+  ]
 }
