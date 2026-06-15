@@ -84,7 +84,7 @@ async function loadBundledFilePath(
 
   try {
     const moduleUrl = new URL(specifier, metaUrl)
-    const loaded = (await import(moduleUrl.href)) as FileImportModule
+    const loaded = (await import(/* @vite-ignore */ moduleUrl.href)) as FileImportModule
     return normalizeLoadedFilePath(loaded.default, moduleUrl.href)
   } catch {
     return undefined

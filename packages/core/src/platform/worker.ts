@@ -138,6 +138,12 @@ function getBuiltinModule<T>(id: string): T | undefined {
     return undefined
   }
 
+  // workerd raises an uncatchable module-fallback error for unsupported builtins (e.g.
+  // node:worker_threads). Skip it there — Workers don't run the tree-sitter parser worker anyway.
+  if (typeof navigator !== "undefined" && (navigator as { userAgent?: string }).userAgent === "Cloudflare-Workers") {
+    return undefined
+  }
+
   const loader = (process as typeof process & ProcessWithBuiltinModule).getBuiltinModule
   if (typeof loader !== "function") {
     return undefined

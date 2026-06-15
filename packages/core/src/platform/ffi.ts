@@ -189,14 +189,58 @@ const isBun =
   process.versions !== null &&
   typeof process.versions.bun === "string"
 
-const requireModule = createRequire(import.meta.url)
-const backend = loadBackend()
+const isCloudflareWorkers =
+  typeof navigator !== "undefined" && (navigator as { userAgent?: string }).userAgent === "Cloudflare-Workers"
+
+// `createRequire(import.meta.url)` must stay lazy. On Cloudflare Workers (workerd) the production
+// bundle leaves `import.meta.url` undefined, so evaluating this at module load throws before
+// loadBackend() can take its workerd early-return. Only the Bun/Node branches of loadBackend() ever
+// call requireModule, so deferring the createRequire keeps import-time clean on workerd.
+let cachedRequire: ReturnType<typeof createRequire> | undefined
+const requireModule = (id: string): unknown => (cachedRequire ??= createRequire(import.meta.url))(id)
+let currentBackend = loadBackend()
+let wasmMode = false
+
+// Swap the active FFI backend (e.g. to a WASM backend from @opentui/wasm). When `wasm` is set,
+// pointers are plain numeric offsets into linear memory and must not be coerced to bigint.
+export function setFfiBackend(backend: FfiBackend, opts?: { wasm?: boolean }): void {
+  currentBackend = backend
+  wasmMode = opts?.wasm ?? false
+}
+
+// An opaque handle to whichever backend is active right now. A RenderLib captures this at
+// construction and re-applies it before each call (`activateBackend`) so multiple wasm renderers
+// can coexist in one isolate — the global `ptr`/`toArrayBuffer` always resolve to the lib's own
+// backend. Cloudflare runs DOs cooperatively (one renderer executes at a time), so re-activating
+// per lib call is sufficient; it is not a substitute for true thread-parallel isolation.
+export type BackendHandle = { readonly backend: FfiBackend; readonly wasm: boolean }
+export function captureBackend(): BackendHandle {
+  return { backend: currentBackend, wasm: wasmMode }
+}
+export function activateBackend(handle: BackendHandle): void {
+  currentBackend = handle.backend
+  wasmMode = handle.wasm
+}
+
+// True when a WASM backend is active. Call sites that pack structs with nested `char*` data (whose
+// bytes must live in wasm linear memory) branch on this to marshal via the swappable ptr().
+export function isWasmBackend(): boolean {
+  return wasmMode
+}
 
 function loadBackend(): FfiBackend {
   // Keep the Bun module import behind the runtime check so Node does not
   // resolve bun:ffi during import.
   if (isBun) {
     return createBunBackend(requireModule("bun:ffi") as BunFfiBackend)
+  }
+
+  // Cloudflare Workers (workerd) has no node:ffi; probing for it triggers an unresolvable
+  // module-fallback request that crashes the isolate (the failure surfaces async, outside the
+  // try/catch below). @opentui/wasm injects the real backend via setFfiBackend(), so start
+  // with the unsupported placeholder instead of touching node:ffi.
+  if (isCloudflareWorkers) {
+    return createUnsupportedBackend(new Error(FFI_UNAVAILABLE))
   }
 
   try {
@@ -210,6 +254,11 @@ function loadBackend(): FfiBackend {
 // Normalize foreign pointer-like values into the current runtime's pointer
 // representation before passing them to native code.
 export function toPointer(value: PointerInput): Pointer {
+  if (wasmMode) {
+    // WASM pointers are numeric linear-memory offsets; pass through unchanged.
+    return value as Pointer
+  }
+
   if (isBun && typeof value === "bigint") {
     return toSafeNumberPointer(value) as Pointer
   }
@@ -648,7 +697,13 @@ function toBigIntPointer(pointer: Pointer): bigint {
   return toSafeBigIntPointer(pointer)
 }
 
-export const dlopen = backend.dlopen
-export const ptr = backend.ptr
-export const suffix = backend.suffix
-export const toArrayBuffer = backend.toArrayBuffer
+export function dlopen<Fns extends Record<string, FFIFunction>>(path: string | URL, symbols: Fns): Library<Fns> {
+  return currentBackend.dlopen(path, symbols)
+}
+export function ptr(value: PointerSource): Pointer {
+  return currentBackend.ptr(value)
+}
+export const suffix = currentBackend.suffix
+export function toArrayBuffer(pointer: Pointer, offset: number | undefined, length: number): ArrayBuffer {
+  return currentBackend.toArrayBuffer(pointer, offset, length)
+}

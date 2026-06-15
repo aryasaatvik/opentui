@@ -1,3 +1,4 @@
+import "./platform/struct-arch.js" // must precede bun-ffi-structs: forces pointerSize=8 in workerd
 import { defineStruct, defineEnum } from "bun-ffi-structs"
 import { ptr, toArrayBuffer, type Pointer } from "./platform/ffi.js"
 import { RGBA, normalizeColorValue } from "./lib/RGBA.js"

@@ -1,5 +1,5 @@
 import { toArrayBuffer, type Pointer } from "./platform/ffi.js"
-import { resolveRenderLib } from "./zig.js"
+import { resolveRenderLib, type RenderLib } from "./zig.js"
 import { SpanInfoStruct } from "./zig-structs.js"
 import type { NativeSpanFeedOptions } from "./zig-structs.js"
 
@@ -17,6 +17,10 @@ function toNumber(value: number | bigint): number {
   return typeof value === "bigint" ? Number(value) : value
 }
 
+function chunkKey(value: Pointer): bigint {
+  return typeof value === "bigint" ? value : BigInt(value)
+}
+
 type StreamEventHandler = (eventId: number, arg0: Pointer, arg1: number | bigint) => void
 
 export type DataHandler = (data: Uint8Array) => void | Promise<void>
@@ -32,10 +36,9 @@ const canThrowAcrossNativeCallback =
  * Chunk and state typed-array views are borrowed and invalid after destroy.
  */
 export class NativeSpanFeed {
-  static create(options?: NativeSpanFeedOptions): NativeSpanFeed {
-    const lib = resolveRenderLib()
+  static create(options?: NativeSpanFeedOptions, lib: RenderLib = resolveRenderLib()): NativeSpanFeed {
     const streamPtr = lib.createNativeSpanFeed(options)
-    const stream = new NativeSpanFeed(streamPtr)
+    const stream = new NativeSpanFeed(streamPtr, lib)
 
     lib.registerNativeSpanFeedStream(streamPtr, stream.eventHandler)
 
@@ -49,9 +52,8 @@ export class NativeSpanFeed {
     return stream
   }
 
-  static attach(streamPtr: Pointer, _options?: NativeSpanFeedOptions): NativeSpanFeed {
-    const lib = resolveRenderLib()
-    const stream = new NativeSpanFeed(streamPtr)
+  static attach(streamPtr: Pointer, _options?: NativeSpanFeedOptions, lib: RenderLib = resolveRenderLib()): NativeSpanFeed {
+    const stream = new NativeSpanFeed(streamPtr, lib)
 
     lib.registerNativeSpanFeedStream(streamPtr, stream.eventHandler)
 
@@ -65,10 +67,14 @@ export class NativeSpanFeed {
   }
 
   readonly streamPtr: Pointer
-  private readonly lib = resolveRenderLib()
+  private readonly lib: RenderLib
   private readonly eventHandler: StreamEventHandler
-  private chunkMap = new Map<Pointer, ArrayBuffer>()
-  private chunkSizes = new Map<Pointer, number>()
+  // Chunk pointers arrive both as native→JS callback args (a JS number for the wasm backend,
+  // a bigint for node:ffi) and as struct fields read by bun-ffi-structs (a bigint at 8-byte
+  // pointer width, except a number under Bun). Normalize every key to bigint so lookups match
+  // regardless of which path produced the pointer.
+  private chunkMap = new Map<bigint, ArrayBuffer>()
+  private chunkSizes = new Map<bigint, number>()
   private dataHandlers = new Set<DataHandler>()
   private errorHandlers = new Set<(code: number) => void>()
   private drainBuffer: Uint8Array | null = null
@@ -86,8 +92,9 @@ export class NativeSpanFeed {
   private pendingHandlerError: unknown = null
   private pendingHandlerErrorQueued = false
 
-  private constructor(streamPtr: Pointer) {
+  private constructor(streamPtr: Pointer, lib: RenderLib) {
     this.streamPtr = streamPtr
+    this.lib = lib
     this.eventHandler = (eventId, arg0, arg1) => {
       this.handleEvent(eventId, arg0, arg1)
     }
@@ -229,11 +236,12 @@ export class NativeSpanFeed {
         case EventId.ChunkAdded: {
           const chunkLen = toNumber(arg1)
           if (chunkLen > 0 && arg0) {
-            if (!this.chunkMap.has(arg0)) {
+            const key = chunkKey(arg0)
+            if (!this.chunkMap.has(key)) {
               const buffer = toArrayBuffer(arg0, 0, chunkLen)
-              this.chunkMap.set(arg0, buffer)
+              this.chunkMap.set(key, buffer)
             }
-            this.chunkSizes.set(arg0, chunkLen)
+            this.chunkSizes.set(key, chunkLen)
           }
           break
         }
@@ -301,17 +309,14 @@ export class NativeSpanFeed {
       for (const span of spans) {
         if (span.len === 0) continue
 
-        let buffer = this.chunkMap.get(span.chunkPtr)
-        if (!buffer) {
-          const size = this.chunkSizes.get(span.chunkPtr)
-          if (!size) continue
-          buffer = toArrayBuffer(span.chunkPtr, 0, size)
-          this.chunkMap.set(span.chunkPtr, buffer)
-        }
+        const size = this.chunkSizes.get(chunkKey(span.chunkPtr))
+        if (!size || span.offset + span.len > size) continue
 
-        if (span.offset + span.len > buffer.byteLength) continue
-
-        const slice = new Uint8Array(buffer, span.offset, span.len)
+        // Read the span bytes directly from native memory per-span. toArrayBuffer aliases on FFI
+        // backends and returns a fresh copy on the WASM backend; reading per-span (instead of
+        // slicing a cached whole-chunk view) is correct for both, since WASM cannot alias a
+        // sub-region of linear memory as a standalone ArrayBuffer.
+        const slice = new Uint8Array(toArrayBuffer(span.chunkPtr, span.offset, span.len))
         let asyncResults: Promise<void>[] | null = null
 
         for (const handler of this.dataHandlers) {
