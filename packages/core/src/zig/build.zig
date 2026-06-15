@@ -40,6 +40,14 @@ const YOGA_CXX_FLAGS = [_][]const u8{
     "-frtti",
 };
 
+// wasm32 has no C++ exception runtime in Zig's bundled libc++abi; Yoga aborts
+// (instead of throwing) on invalid input, which is fine for OpenTUI's valid layout.
+const YOGA_CXX_FLAGS_WASM = [_][]const u8{
+    "-std=c++20",
+    "-fno-exceptions",
+    "-fno-rtti",
+};
+
 const YOGA_CXX_SOURCES = [_][]const u8{
     "yoga/YGConfig.cpp",
     "yoga/YGEnums.cpp",
@@ -202,10 +210,11 @@ fn addYogaDependencies(b: *std.Build, artifact: *std.Build.Step.Compile) void {
 
     artifact.linkLibCpp();
     artifact.addIncludePath(yoga_dep.path(""));
+    const is_wasm = artifact.rootModuleTarget().cpu.arch == .wasm32;
     artifact.addCSourceFiles(.{
         .root = yoga_dep.path(""),
         .files = &YOGA_CXX_SOURCES,
-        .flags = &YOGA_CXX_FLAGS,
+        .flags = if (is_wasm) &YOGA_CXX_FLAGS_WASM else &YOGA_CXX_FLAGS,
     });
 }
 
@@ -380,6 +389,29 @@ pub fn build(b: *std.Build) void {
     });
     const run_debug = b.addRunArtifact(debug_exe);
     debug_step.dependOn(&run_debug.step);
+
+    // WASM step (Cloudflare Worker / browser) — wasm32-wasi reactor module.
+    // Yoga compiles with -fno-exceptions; audio is the wasm stub (see lib.zig).
+    const wasm_step = b.step("wasm", "Build wasm32-wasi reactor module (opentui.wasm)");
+    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
+    const wasm_optimize = b.option(std.builtin.OptimizeMode, "wasm-optimize", "Optimize mode for wasm") orelse .ReleaseSmall;
+    const wasm_mod = b.createModule(.{
+        .root_source_file = b.path(ROOT_SOURCE_FILE),
+        .target = wasm_target,
+        .optimize = wasm_optimize,
+    });
+    applyDependencies(b, wasm_mod, wasm_optimize, wasm_target, build_options);
+    const wasm = b.addExecutable(.{
+        .name = "opentui",
+        .root_module = wasm_mod,
+    });
+    wasm.wasi_exec_model = .reactor;
+    wasm.rdynamic = true;
+    addYogaDependencies(b, wasm);
+    const install_wasm = b.addInstallArtifact(wasm, .{
+        .dest_dir = .{ .override = .{ .custom = "../lib/wasm32" } },
+    });
+    wasm_step.dependOn(&install_wasm.step);
 }
 
 fn buildAllTargets(

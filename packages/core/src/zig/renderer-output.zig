@@ -16,6 +16,8 @@
 //! writer without scattering backend-specific switches across the codebase.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const is_wasm = builtin.cpu.arch == .wasm32;
 const Allocator = std.mem.Allocator;
 const NativeSpanFeed = @import("native-span-feed.zig");
 
@@ -279,6 +281,8 @@ pub const BufferedBackend = struct {
     }
 
     pub fn setUseThread(self: *BufferedBackend, use_thread: bool) void {
+        // wasm is single-threaded: the render thread never spawns; rendering stays inline.
+        if (is_wasm) return;
         if (use_thread and !self.supportsThreading()) return;
         if (self.useThread == use_thread) return;
 

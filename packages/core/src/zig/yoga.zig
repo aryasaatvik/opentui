@@ -4,6 +4,16 @@ const c = @cImport({
     @cInclude("yoga/Yoga.h");
 });
 
+const builtin = @import("builtin");
+const is_wasm = builtin.cpu.arch == .wasm32;
+
+// wasm has no indirect function table for native->JS calls, so measure/dirtied callbacks are
+// routed through imported functions the host (@opentui/wasm) provides; JS maps node -> JS fn.
+const host = if (is_wasm) struct {
+    extern "env" fn ot_yogaMeasure(node: YGNodeConstRef, width: f32, width_mode: u32, height: f32, height_mode: u32) void;
+    extern "env" fn ot_yogaDirtied(node: YGNodeConstRef) void;
+} else struct {};
+
 pub const YGNodeRef = c.YGNodeRef;
 pub const YGNodeConstRef = c.YGNodeConstRef;
 pub const YGConfigRef = c.YGConfigRef;
@@ -237,9 +247,15 @@ fn internalMeasureFunc(
     tls_measure_height = std.math.nan(f32);
 
     if (getContext(node)) |ctx| {
-        if (ctx.measure_callback) |callback| {
-            const trampoline: JsMeasureCallback = @ptrCast(@alignCast(callback));
-            trampoline(null, width, enumValue(width_mode), height, enumValue(height_mode));
+        if (comptime is_wasm) {
+            if (ctx.measure_callback != null) {
+                host.ot_yogaMeasure(node, width, enumValue(width_mode), height, enumValue(height_mode));
+            }
+        } else {
+            if (ctx.measure_callback) |callback| {
+                const trampoline: JsMeasureCallback = @ptrCast(@alignCast(callback));
+                trampoline(null, width, enumValue(width_mode), height, enumValue(height_mode));
+            }
         }
     }
 
@@ -248,9 +264,15 @@ fn internalMeasureFunc(
 
 fn internalDirtiedFunc(node: YGNodeConstRef) callconv(.c) void {
     if (getContext(node)) |ctx| {
-        if (ctx.dirtied_callback) |callback| {
-            const trampoline: JsDirtiedCallback = @ptrCast(@alignCast(callback));
-            trampoline();
+        if (comptime is_wasm) {
+            if (ctx.dirtied_callback != null) {
+                host.ot_yogaDirtied(node);
+            }
+        } else {
+            if (ctx.dirtied_callback) |callback| {
+                const trampoline: JsDirtiedCallback = @ptrCast(@alignCast(callback));
+                trampoline();
+            }
         }
     }
 }

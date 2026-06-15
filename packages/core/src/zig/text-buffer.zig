@@ -40,16 +40,22 @@ pub const TextBuffer = UnifiedTextBuffer;
 /// The color pointers point to 4 consecutive u16 values in the packed RGBA
 /// format defined by ansi.zig. Use utils.ptrToRGBA to read them.
 pub const StyledChunk = extern struct {
-    text_ptr: [*]const u8,
-    text_len: usize,
-    /// Optional foreground color as 4 packed u16 values (see ansi.RGBA).
-    fg_ptr: ?[*]const u16,
-    /// Optional background color as 4 packed u16 values (see ansi.RGBA).
-    bg_ptr: ?[*]const u16,
+    // Pointer + length fields are u64 (not native pointer/usize) so the extern layout matches the JS
+    // FFI struct on both 64-bit native and 32-bit wasm32. 0 = null for the optional color/link pointers.
+    text_ptr: u64,
+    text_len: u64,
+    /// Optional foreground color as 4 packed u16 values (see ansi.RGBA); 0 = none.
+    fg_ptr: u64,
+    /// Optional background color as 4 packed u16 values (see ansi.RGBA); 0 = none.
+    bg_ptr: u64,
     attributes: u32,
-    link_ptr: ?[*]const u8 = null,
-    link_len: usize = 0,
+    link_ptr: u64 = 0,
+    link_len: u64 = 0,
 };
+
+inline fn ptrFromU64(comptime T: type, value: u64) [*]const T {
+    return @ptrFromInt(@as(usize, @intCast(value)));
+}
 
 pub const UnifiedTextBuffer = struct {
     const Self = UnifiedTextBuffer;
@@ -1090,7 +1096,7 @@ pub const UnifiedTextBuffer = struct {
         // Calculate total text length
         var total_len: usize = 0;
         for (chunks) |chunk| {
-            total_len += chunk.text_len;
+            total_len += @intCast(chunk.text_len);
         }
 
         if (total_len == 0) {
@@ -1120,9 +1126,10 @@ pub const UnifiedTextBuffer = struct {
         var offset: usize = 0;
         for (chunks) |chunk| {
             if (chunk.text_len > 0) {
-                const chunk_text = chunk.text_ptr[0..chunk.text_len];
-                @memcpy(full_text[offset .. offset + chunk.text_len], chunk_text);
-                offset += chunk.text_len;
+                const text_len: usize = @intCast(chunk.text_len);
+                const chunk_text = ptrFromU64(u8, chunk.text_ptr)[0..text_len];
+                @memcpy(full_text[offset .. offset + text_len], chunk_text);
+                offset += text_len;
             }
         }
 
@@ -1144,18 +1151,18 @@ pub const UnifiedTextBuffer = struct {
 
             var char_pos: u32 = 0;
             for (chunks, 0..) |chunk, i| {
-                const chunk_text = chunk.text_ptr[0..chunk.text_len];
+                const chunk_text = ptrFromU64(u8, chunk.text_ptr)[0..@as(usize, @intCast(chunk.text_len))];
                 const chunk_len = self.measureText(chunk_text);
 
                 if (chunk_len > 0) {
-                    const fg = if (chunk.fg_ptr) |fgPtr| utils.ptrToRGBA(fgPtr) else null;
-                    const bg = if (chunk.bg_ptr) |bgPtr| utils.ptrToRGBA(bgPtr) else null;
+                    const fg = if (chunk.fg_ptr != 0) utils.ptrToRGBA(ptrFromU64(u16, chunk.fg_ptr)) else null;
+                    const bg = if (chunk.bg_ptr != 0) utils.ptrToRGBA(ptrFromU64(u16, chunk.bg_ptr)) else null;
 
                     var attributes = chunk.attributes;
-                    if (chunk.link_ptr) |link_ptr| {
+                    if (chunk.link_ptr != 0) {
                         if (chunk.link_len > 0) {
                             const tracker = self.getLinkTracker();
-                            const url = link_ptr[0..chunk.link_len];
+                            const url = ptrFromU64(u8, chunk.link_ptr)[0..@as(usize, @intCast(chunk.link_len))];
                             const link_id = tracker.pool.alloc(url) catch 0;
                             if (link_id != 0) {
                                 const maybe_seen = seen_link_ids.getOrPut(self.global_allocator, link_id) catch null;
@@ -1200,7 +1207,7 @@ pub const UnifiedTextBuffer = struct {
 
         self.clear();
 
-        const content = self.allocator.alloc(u8, file_size) catch return TextBufferError.OutOfMemory;
+        const content = self.allocator.alloc(u8, @intCast(file_size)) catch return TextBufferError.OutOfMemory;
         const bytes_read = file.readAll(content) catch return TextBufferError.OutOfMemory;
         const text = content[0..bytes_read];
         const mem_id = try self.mem_registry.register(text, false);

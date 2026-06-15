@@ -1,6 +1,14 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const is_wasm = builtin.cpu.arch == .wasm32;
 
 pub const CallbackFn = fn (stream_ptr: usize, event_id: u32, arg0: usize, arg1: u64) callconv(.c) void;
+
+// wasm has no fn table for native->JS calls; feed events route through an imported dispatcher
+// (the host maps stream_ptr -> the registered JS event handler).
+const host = if (is_wasm) struct {
+    extern "env" fn ot_dispatchSpanFeedEvent(stream_ptr: usize, event_id: u32, arg0: usize, arg1: u64) void;
+} else struct {};
 
 pub const GrowthPolicy = enum(u8) {
     grow = 0,
@@ -29,14 +37,16 @@ const Chunk = struct {
 };
 
 pub const SpanInfo = extern struct {
-    chunk_ptr: usize,
+    // Fixed u64 (not usize) so the struct layout matches the JS FFI struct on both 64-bit native
+    // and 32-bit wasm32 (where usize would be 4 bytes and shift every following field).
+    chunk_ptr: u64,
     offset: u32,
     len: u32,
     chunk_index: u32,
     reserved: u32,
 
     pub fn slice(self: SpanInfo) []u8 {
-        const base: [*]u8 = @ptrFromInt(self.chunk_ptr);
+        const base: [*]u8 = @ptrFromInt(@as(usize, @intCast(self.chunk_ptr)));
         const start: usize = @intCast(self.offset);
         const length: usize = @intCast(self.len);
         return base[start .. start + length];
@@ -122,12 +132,13 @@ const SpanRing = struct {
 };
 
 pub const ReserveInfo = extern struct {
-    ptr: usize,
+    // u64 (not usize) so the FFI layout matches TS pointerSize=8 on wasm32 too; see SpanInfo.
+    ptr: u64,
     len: u32,
     reserved: u32,
 
     pub fn slice(self: ReserveInfo) []u8 {
-        const base: [*]u8 = @ptrFromInt(self.ptr);
+        const base: [*]u8 = @ptrFromInt(@as(usize, @intCast(self.ptr)));
         const length: usize = @intCast(self.len);
         return base[0..length];
     }
@@ -549,28 +560,28 @@ pub const Stream = struct {
         self.pending_len = 0;
     }
 
-    fn emitChunkAdded(self: *Stream, chunk: Chunk) void {
-        if (self.callback) |cb| {
-            cb(@intFromPtr(self), Event.ChunkAdded, @intFromPtr(chunk.ptr), chunk.len);
+    inline fn dispatch(self: *Stream, event_id: u32, arg0: usize, arg1: u64) void {
+        if (comptime is_wasm) {
+            if (self.callback != null) host.ot_dispatchSpanFeedEvent(@intFromPtr(self), event_id, arg0, arg1);
+        } else {
+            if (self.callback) |cb| cb(@intFromPtr(self), event_id, arg0, arg1);
         }
+    }
+
+    fn emitChunkAdded(self: *Stream, chunk: Chunk) void {
+        self.dispatch(Event.ChunkAdded, @intFromPtr(chunk.ptr), chunk.len);
     }
 
     fn emitDataAvailable(self: *Stream, count: u32) void {
-        if (self.callback) |cb| {
-            cb(@intFromPtr(self), Event.DataAvailable, count, 0);
-        }
+        self.dispatch(Event.DataAvailable, count, 0);
     }
 
     fn emitStateBuffer(self: *Stream) void {
-        if (self.callback) |cb| {
-            cb(@intFromPtr(self), Event.StateBuffer, @intFromPtr(self.state_buffer.ptr), self.state_capacity);
-        }
+        self.dispatch(Event.StateBuffer, @intFromPtr(self.state_buffer.ptr), self.state_capacity);
     }
 
     fn emitClosed(self: *Stream) void {
-        if (self.callback) |cb| {
-            cb(@intFromPtr(self), Event.Closed, 0, 0);
-        }
+        self.dispatch(Event.Closed, 0, 0);
     }
 };
 

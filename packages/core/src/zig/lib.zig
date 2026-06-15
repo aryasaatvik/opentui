@@ -1,6 +1,9 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
+
+const is_wasm = builtin.cpu.arch == .wasm32;
 
 const ansi = @import("ansi.zig");
 const buffer = @import("buffer.zig");
@@ -18,7 +21,7 @@ const utf8 = @import("utf8.zig");
 const logger = @import("logger.zig");
 const event_bus = @import("event-bus.zig");
 const native_span_feed = @import("native-span-feed.zig");
-const native_audio = @import("audio.zig");
+const native_audio = if (is_wasm) @import("audio-stub.zig") else @import("audio.zig");
 const buffer_effects = @import("buffer-methods.zig");
 const handles = @import("handles.zig");
 const native_yoga = @import("yoga.zig");
@@ -87,13 +90,13 @@ fn acquireAudioEngine(handle: NativeHandle) ?*native_audio.Engine {
 
 fn emptyLineInfo(outPtr: *ExternalLineInfo) void {
     outPtr.* = .{
-        .start_cols_ptr = EMPTY_U32[0..].ptr,
+        .start_cols_ptr = @intFromPtr(EMPTY_U32[0..].ptr),
         .start_cols_len = 0,
-        .width_cols_ptr = EMPTY_U32[0..].ptr,
+        .width_cols_ptr = @intFromPtr(EMPTY_U32[0..].ptr),
         .width_cols_len = 0,
-        .sources_ptr = EMPTY_U32[0..].ptr,
+        .sources_ptr = @intFromPtr(EMPTY_U32[0..].ptr),
         .sources_len = 0,
-        .wraps_ptr = EMPTY_U32[0..].ptr,
+        .wraps_ptr = @intFromPtr(EMPTY_U32[0..].ptr),
         .wraps_len = 0,
         .width_cols_max = 0,
     };
@@ -157,6 +160,21 @@ var gpa: std.heap.GeneralPurposeAllocator(.{
 const globalAllocator = gpa.allocator();
 var arena = std.heap.ArenaAllocator.init(globalAllocator);
 const globalArena = arena.allocator();
+
+// WASM marshalling helpers: let JS allocate/free scratch buffers in linear memory
+// (text, color arrays, span-drain output). No-ops are harmless on native (unused).
+export fn ot_alloc(size: usize) ?[*]u8 {
+    if (size == 0) return null;
+    const mem = globalAllocator.alloc(u8, size) catch return null;
+    return mem.ptr;
+}
+
+export fn ot_free(ptr: ?[*]u8, size: usize) void {
+    if (ptr) |p| {
+        if (size == 0) return;
+        globalAllocator.free(p[0..size]);
+    }
+}
 
 pub const ExternalBuildOptions = extern struct {
     gpa_safe_stats: bool,
@@ -776,18 +794,20 @@ pub const ExternalCapabilities = extern struct {
     explicit_cursor_positioning: bool,
     remote: bool,
     multiplexer: u8,
-    term_name_ptr: [*]const u8,
-    term_name_len: usize,
-    term_version_ptr: [*]const u8,
-    term_version_len: usize,
+    // u64 (not [*]const u8 / usize) so the layout is identical for native (8-byte ptr) and
+    // wasm32 (4-byte ptr widened into 8). TS reads these at pointerSize=8 on both. See zig.ts.
+    term_name_ptr: u64,
+    term_name_len: u64,
+    term_version_ptr: u64,
+    term_version_len: u64,
     term_from_xtversion: bool,
 };
 
 export fn getTerminalCapabilities(renderer_handle: NativeHandle, capsPtr: *ExternalCapabilities) void {
     const object_ptr = acquireRenderer(renderer_handle) orelse {
         capsPtr.* = std.mem.zeroes(ExternalCapabilities);
-        capsPtr.term_name_ptr = EMPTY_U8[0..].ptr;
-        capsPtr.term_version_ptr = EMPTY_U8[0..].ptr;
+        capsPtr.term_name_ptr = @intFromPtr(EMPTY_U8[0..].ptr);
+        capsPtr.term_version_ptr = @intFromPtr(EMPTY_U8[0..].ptr);
         return;
     };
     const caps = object_ptr.getTerminalCapabilities();
@@ -813,10 +833,10 @@ export fn getTerminalCapabilities(renderer_handle: NativeHandle, capsPtr: *Exter
         .explicit_cursor_positioning = caps.explicit_cursor_positioning,
         .remote = caps.remote,
         .multiplexer = @intFromEnum(term.multiplexer),
-        .term_name_ptr = &term.term_info.name,
-        .term_name_len = term.term_info.name_len,
-        .term_version_ptr = &term.term_info.version,
-        .term_version_len = term.term_info.version_len,
+        .term_name_ptr = @intFromPtr(&term.term_info.name),
+        .term_name_len = @as(u64, term.term_info.name_len),
+        .term_version_ptr = @intFromPtr(&term.term_info.version),
+        .term_version_len = @as(u64, term.term_info.version_len),
         .term_from_xtversion = term.term_info.from_xtversion,
     };
 }
@@ -1633,13 +1653,13 @@ export fn textBufferViewGetLineInfoDirect(view_handle: NativeHandle, outPtr: *Ex
     const line_info = object_ptr.getCachedLineInfo();
 
     outPtr.* = .{
-        .start_cols_ptr = line_info.line_start_cols.ptr,
+        .start_cols_ptr = @intFromPtr(line_info.line_start_cols.ptr),
         .start_cols_len = @intCast(line_info.line_start_cols.len),
-        .width_cols_ptr = line_info.line_width_cols.ptr,
+        .width_cols_ptr = @intFromPtr(line_info.line_width_cols.ptr),
         .width_cols_len = @intCast(line_info.line_width_cols.len),
-        .sources_ptr = line_info.line_sources.ptr,
+        .sources_ptr = @intFromPtr(line_info.line_sources.ptr),
         .sources_len = @intCast(line_info.line_sources.len),
-        .wraps_ptr = line_info.line_wraps.ptr,
+        .wraps_ptr = @intFromPtr(line_info.line_wraps.ptr),
         .wraps_len = @intCast(line_info.line_wraps.len),
         .width_cols_max = line_info.line_width_cols_max,
     };
@@ -1653,13 +1673,13 @@ export fn textBufferViewGetLogicalLineInfoDirect(view_handle: NativeHandle, outP
     const line_info = object_ptr.getLogicalLineInfo();
 
     outPtr.* = .{
-        .start_cols_ptr = line_info.line_start_cols.ptr,
+        .start_cols_ptr = @intFromPtr(line_info.line_start_cols.ptr),
         .start_cols_len = @intCast(line_info.line_start_cols.len),
-        .width_cols_ptr = line_info.line_width_cols.ptr,
+        .width_cols_ptr = @intFromPtr(line_info.line_width_cols.ptr),
         .width_cols_len = @intCast(line_info.line_width_cols.len),
-        .sources_ptr = line_info.line_sources.ptr,
+        .sources_ptr = @intFromPtr(line_info.line_sources.ptr),
         .sources_len = @intCast(line_info.line_sources.len),
-        .wraps_ptr = line_info.line_wraps.ptr,
+        .wraps_ptr = @intFromPtr(line_info.line_wraps.ptr),
         .wraps_len = @intCast(line_info.line_wraps.len),
         .width_cols_max = line_info.line_width_cols_max,
     };
@@ -2114,13 +2134,13 @@ export fn editorViewGetLineInfoDirect(view_handle: NativeHandle, outPtr: *Extern
     };
     const line_info = object_ptr.getCachedLineInfo();
     outPtr.* = .{
-        .start_cols_ptr = line_info.line_start_cols.ptr,
+        .start_cols_ptr = @intFromPtr(line_info.line_start_cols.ptr),
         .start_cols_len = @intCast(line_info.line_start_cols.len),
-        .width_cols_ptr = line_info.line_width_cols.ptr,
+        .width_cols_ptr = @intFromPtr(line_info.line_width_cols.ptr),
         .width_cols_len = @intCast(line_info.line_width_cols.len),
-        .sources_ptr = line_info.line_sources.ptr,
+        .sources_ptr = @intFromPtr(line_info.line_sources.ptr),
         .sources_len = @intCast(line_info.line_sources.len),
-        .wraps_ptr = line_info.line_wraps.ptr,
+        .wraps_ptr = @intFromPtr(line_info.line_wraps.ptr),
         .wraps_len = @intCast(line_info.line_wraps.len),
         .width_cols_max = line_info.line_width_cols_max,
     };
@@ -2138,13 +2158,13 @@ export fn editorViewGetLogicalLineInfoDirect(view_handle: NativeHandle, outPtr: 
     };
     const line_info = object_ptr.getLogicalLineInfo();
     outPtr.* = .{
-        .start_cols_ptr = line_info.line_start_cols.ptr,
+        .start_cols_ptr = @intFromPtr(line_info.line_start_cols.ptr),
         .start_cols_len = @intCast(line_info.line_start_cols.len),
-        .width_cols_ptr = line_info.line_width_cols.ptr,
+        .width_cols_ptr = @intFromPtr(line_info.line_width_cols.ptr),
         .width_cols_len = @intCast(line_info.line_width_cols.len),
-        .sources_ptr = line_info.line_sources.ptr,
+        .sources_ptr = @intFromPtr(line_info.line_sources.ptr),
         .sources_len = @intCast(line_info.line_sources.len),
-        .wraps_ptr = line_info.line_wraps.ptr,
+        .wraps_ptr = @intFromPtr(line_info.line_wraps.ptr),
         .wraps_len = @intCast(line_info.line_wraps.len),
         .width_cols_max = line_info.line_width_cols_max,
     };
@@ -2424,13 +2444,14 @@ pub const ExternalVisualCursor = extern struct {
 };
 
 pub const ExternalLineInfo = extern struct {
-    start_cols_ptr: [*]const u32,
+    // u64 (not [*]const u32) so the FFI layout matches TS pointerSize=8 on wasm32 too; see SpanInfo.
+    start_cols_ptr: u64,
     start_cols_len: u32,
-    width_cols_ptr: [*]const u32,
+    width_cols_ptr: u64,
     width_cols_len: u32,
-    sources_ptr: [*]const u32,
+    sources_ptr: u64,
     sources_len: u32,
-    wraps_ptr: [*]const u32,
+    wraps_ptr: u64,
     wraps_len: u32,
     width_cols_max: u32,
 };
