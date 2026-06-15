@@ -1,7 +1,5 @@
 import { Parser, Query, Tree, Language } from "web-tree-sitter"
 import type { Edit, QueryCapture, Range } from "web-tree-sitter"
-import { mkdir } from "fs/promises"
-import * as path from "path"
 import type {
   HighlightRange,
   HighlightResponse,
@@ -14,14 +12,21 @@ import type {
   TreeSitterWorkerResponse,
 } from "./types.js"
 import { DownloadUtils } from "./download-utils.js"
-import { isBunfsPath, normalizeBunfsPath } from "../bunfs.js"
-import { resolveBundledFilePath } from "../../platform/runtime.js"
 import {
   isWorkerRuntime,
   postWorkerMessage,
   setWorkerMessageHandler,
   type WorkerMessageEvent,
 } from "../../platform/worker.js"
+
+// Node's fs/promises, or null in runtimes without a filesystem (browser) — disk caching is optional.
+async function nodeFsPromises(): Promise<typeof import("node:fs/promises") | null> {
+  try {
+    return await import("node:fs/promises")
+  } catch {
+    return null
+  }
+}
 
 type ParserState = {
   parser: Parser
@@ -90,26 +95,31 @@ class ParserWorker {
     }
     this.initializePromise = (async () => {
       this.dataPath = dataPath
-      this.tsDataPath = path.join(dataPath, "tree-sitter")
+      this.tsDataPath = `${dataPath}/tree-sitter`
 
-      await mkdir(path.join(this.tsDataPath, "languages"), { recursive: true })
-      await mkdir(path.join(this.tsDataPath, "queries"), { recursive: true })
-
-      let treeWasm = await resolveBundledFilePath(
-        () => import("web-tree-sitter/tree-sitter.wasm" as string, { with: { type: "wasm" } }),
-        () => import.meta.resolve("web-tree-sitter/tree-sitter.wasm"),
-        import.meta.url,
-      )
-
-      if (isBunfsPath(treeWasm)) {
-        treeWasm = normalizeBunfsPath(path.parse(treeWasm).base)
+      // Pre-create the on-disk cache dirs on native runtimes (surfaces a bad data path early); a
+      // browser has no filesystem, so it skips caching entirely.
+      const fs = await nodeFsPromises()
+      if (fs) {
+        await fs.mkdir(`${this.tsDataPath}/languages`, { recursive: true })
+        await fs.mkdir(`${this.tsDataPath}/queries`, { recursive: true })
       }
 
-      await Parser.init({
-        locateFile() {
-          return treeWasm
-        },
-      })
+      // Load the web-tree-sitter runtime wasm from bytes (portable: file:// on native, fetched URL in
+      // browsers) and hand it to Emscripten via wasmBinary — no per-bundler locateFile path needed.
+      const treeWasmUrl = new URL("./assets/tree-sitter.wasm", import.meta.url).href
+      const { content: treeWasm, error } = await DownloadUtils.downloadOrLoad(
+        treeWasmUrl,
+        this.tsDataPath,
+        "runtime",
+        ".wasm",
+        false,
+      )
+      if (error || !treeWasm) {
+        throw new Error(`Failed to load tree-sitter runtime wasm: ${error ?? "no content"}`)
+      }
+
+      await Parser.init({ wasmBinary: treeWasm } as Parameters<typeof Parser.init>[0])
 
       this.initialized = true
     })()
@@ -212,18 +222,16 @@ class ParserWorker {
       return undefined
     }
 
-    if (!result.filePath) {
+    if (!result.content) {
       return undefined
     }
 
-    // Normalize path for Windows compatibility - tree-sitter expects forward slashes
-    const normalizedPath = result.filePath.replaceAll("\\", "/")
-
     try {
-      const language = await Language.load(normalizedPath)
+      // Load from bytes — portable across native and browser (no filesystem path required).
+      const language = await Language.load(result.content)
       return language
     } catch (error) {
-      console.error(`Error loading language from ${normalizedPath}:`, error)
+      console.error(`Error loading language ${languageSource}:`, error)
       return undefined
     }
   }
@@ -879,11 +887,14 @@ class ParserWorker {
 
   async updateDataPath(dataPath: string): Promise<void> {
     this.dataPath = dataPath
-    this.tsDataPath = path.join(dataPath, "tree-sitter")
+    this.tsDataPath = `${dataPath}/tree-sitter`
+
+    const fs = await nodeFsPromises()
+    if (!fs) return // browser: no on-disk cache
 
     try {
-      await mkdir(path.join(this.tsDataPath, "languages"), { recursive: true })
-      await mkdir(path.join(this.tsDataPath, "queries"), { recursive: true })
+      await fs.mkdir(`${this.tsDataPath}/languages`, { recursive: true })
+      await fs.mkdir(`${this.tsDataPath}/queries`, { recursive: true })
     } catch (error) {
       throw new Error(`Failed to update data path: ${error}`)
     }
@@ -894,15 +905,15 @@ class ParserWorker {
       throw new Error("No data path configured")
     }
 
-    const { rm } = await import("fs/promises")
+    const { rm, mkdir } = await import("node:fs/promises")
 
     try {
-      const treeSitterPath = path.join(this.dataPath, "tree-sitter")
+      const treeSitterPath = `${this.dataPath}/tree-sitter`
 
       await rm(treeSitterPath, { recursive: true, force: true })
 
-      await mkdir(path.join(treeSitterPath, "languages"), { recursive: true })
-      await mkdir(path.join(treeSitterPath, "queries"), { recursive: true })
+      await mkdir(`${treeSitterPath}/languages`, { recursive: true })
+      await mkdir(`${treeSitterPath}/queries`, { recursive: true })
 
       this.filetypeParsers.clear()
       this.filetypeParserPromises.clear()

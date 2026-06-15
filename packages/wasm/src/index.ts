@@ -1,0 +1,7 @@
+export { createWasmRuntime } from "./runtime.js"
+export type { WasmRuntime, WasmRuntimeOptions, WasmHostImports } from "./runtime.js"
+export { createWasiShim } from "./wasi.js"
+export type { WasiShim } from "./wasi.js"
+export { createWasmBackend } from "./backend.js"
+export type { WasmFfi } from "./backend.js"
+export { createWasmRenderLib } from "./render-lib.js"

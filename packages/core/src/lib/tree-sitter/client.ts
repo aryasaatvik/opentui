@@ -13,7 +13,8 @@ import type {
   TreeSitterWorkerRequest,
   TreeSitterWorkerResponse,
 } from "./types.js"
-import { getParsers } from "./default-parsers.js"
+// `default-parsers` (and the .scm/.wasm assets it references) is imported lazily so it stays out of
+// the bundle graph for consumers that never use syntax highlighting (e.g. the Cloudflare worker).
 import { resolve, isAbsolute, parse } from "path"
 import { existsSync } from "fs"
 import { registerEnvVar, env } from "../env.js"
@@ -332,6 +333,7 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
     generation: number = this.lifecycleGeneration,
     worker: TreeSitterWorkerHandle = this.worker!,
   ): Promise<void> {
+    const { getParsers } = await import("./default-parsers.js")
     const defaultParsers = await getParsers()
     this.assertCurrentInitialization(generation, worker)
     const overriddenFiletypes = new Set(DEFAULT_PARSER_OVERRIDES.map((parser) => parser.filetype))
@@ -345,7 +347,7 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
   }
 
   private resolvePath(path: string): string {
-    if (isUrl(path)) {
+    if (isUrl(path) || path.startsWith("file://")) {
       return path
     }
     if (isBunfsPath(path)) {

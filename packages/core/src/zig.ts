@@ -4,10 +4,15 @@ import {
   toArrayBuffer,
   ptr,
   toPointer,
+  isWasmBackend,
+  captureBackend,
+  activateBackend,
+  type BackendHandle,
   type FFICallbackInstance,
   type Pointer,
 } from "./platform/ffi.js"
 import { writeFile } from "./platform/runtime.js"
+export { setFfiBackend } from "./platform/ffi.js"
 import { existsSync, writeFileSync } from "fs"
 import { EventEmitter } from "events"
 import {
@@ -77,48 +82,42 @@ function validateLinuxLibcOverride(): void {
   throw new Error(`On Linux, OPENTUI_LIBC must be unset, empty, "glibc", or "musl", got "${libc}"`)
 }
 
-async function resolveNativePackage() {
+// The prebuilt native binding for the current platform. Returned as a variable specifier (not a
+// literal) so bundlers leave the dynamic import un-analyzed — on workerd/browser these packages are
+// absent and the import fails at runtime, which is caught below and a WASM backend is injected instead.
+function nativePackageName(): string {
   if (process.platform === "darwin") {
-    // @ts-ignore Optional native package may be absent when building on another platform.
-    if (process.arch === "x64") return await import("@opentui/core-darwin-x64")
-    // @ts-ignore Optional native package may be absent when building on another platform.
-    if (process.arch === "arm64") return await import("@opentui/core-darwin-arm64")
+    if (process.arch === "x64") return "@opentui/core-darwin-x64"
+    if (process.arch === "arm64") return "@opentui/core-darwin-arm64"
   }
 
   if (process.platform === "linux") {
     validateLinuxLibcOverride()
-
-    if (process.arch === "x64") {
-      if (process.env.OPENTUI_LIBC === "musl") {
-        // @ts-ignore Optional native package may be absent unless building a musl target.
-        return await import("@opentui/core-linux-x64-musl")
-      } else {
-        // @ts-ignore Optional native package may be absent when building on another platform.
-        return await import("@opentui/core-linux-x64")
-      }
-    }
-
-    if (process.arch === "arm64") {
-      if (process.env.OPENTUI_LIBC === "musl") {
-        // @ts-ignore Optional native package may be absent unless building a musl target.
-        return await import("@opentui/core-linux-arm64-musl")
-      } else {
-        // @ts-ignore Optional native package may be absent when building on another platform.
-        return await import("@opentui/core-linux-arm64")
-      }
-    }
+    const musl = process.env.OPENTUI_LIBC === "musl"
+    if (process.arch === "x64") return musl ? "@opentui/core-linux-x64-musl" : "@opentui/core-linux-x64"
+    if (process.arch === "arm64") return musl ? "@opentui/core-linux-arm64-musl" : "@opentui/core-linux-arm64"
   }
 
   if (process.platform === "win32") {
-    // @ts-ignore Optional native package may be absent when building on another platform.
-    if (process.arch === "x64") return await import("@opentui/core-win32-x64")
-    // @ts-ignore Optional native package may be absent when building on another platform.
-    if (process.arch === "arm64") return await import("@opentui/core-win32-arm64")
+    if (process.arch === "x64") return "@opentui/core-win32-x64"
+    if (process.arch === "arm64") return "@opentui/core-win32-arm64"
   }
 
   throw new Error(`opentui is not supported on the current platform: ${process.platform}-${process.arch}`)
 }
-const nativePackage = await resolveNativePackage()
+
+async function resolveNativePackage() {
+  const name = nativePackageName()
+  return await import(/* @vite-ignore */ name)
+}
+// Native package resolution can fail on platforms without a prebuilt (e.g. workerd / browser).
+// Don't throw at import time — a WASM runtime can be injected via setFfiBackend()/setRenderLib().
+let nativePackage: { default: string } | null = null
+try {
+  nativePackage = (await resolveNativePackage()) as { default: string }
+} catch {
+  nativePackage = null
+}
 
 export type NativeHandle<T extends string> = Pointer & { readonly __nativeHandle: T }
 export type RendererHandle = NativeHandle<"renderer">
@@ -130,14 +129,16 @@ export type EditorViewHandle = NativeHandle<"editor_view">
 export type SyntaxStyleHandle = NativeHandle<"syntax_style">
 export type EventSinkHandle = NativeHandle<"event_sink">
 export type AudioEngineHandle = NativeHandle<"audio_engine">
-let targetLibPath = nativePackage.default
+let targetLibPath: string | undefined = nativePackage?.default
 
-if (isBunfsPath(targetLibPath)) {
+if (targetLibPath && isBunfsPath(targetLibPath)) {
   targetLibPath = targetLibPath.replace("../", "")
 }
 
-if (!existsSync(targetLibPath)) {
-  throw new Error(`opentui is not supported on the current platform: ${process.platform}-${process.arch}`)
+// A missing native lib is not fatal at import time: native methods throw when actually used, but a
+// WASM runtime injected via setRenderLib() never resolves this path (it passes its own lib path).
+if (targetLibPath && !existsSync(targetLibPath)) {
+  targetLibPath = undefined
 }
 
 registerEnvVar({
@@ -1903,6 +1904,10 @@ export interface AudioEngineLib {
 }
 
 export interface RenderLib extends AudioEngineLib {
+  // Re-assert this lib's FFI backend as the active one (instance-scoped multi-renderer support).
+  // No-op on the native single-global path; present on libs from createRenderLib(). The renderer
+  // calls it at the start of each frame so renderable/buffer native ops bind to the right backend.
+  activate?: () => void
   createRenderer: (width: number, height: number, options?: NativeRendererCreateOptions) => RendererHandle | null
   setTerminalEnvVar: (renderer: RendererHandle, key: string, value: string) => boolean
   destroyRenderer: (renderer: RendererHandle) => void
@@ -2514,6 +2519,21 @@ class FFIRenderLib implements RenderLib {
   private nativeSpanFeedCallbackWrapper: FFICallbackInstance | null = null
   private nativeSpanFeedHandlers = new Map<Pointer, NativeSpanFeedEventHandler>()
 
+  // The FFI backend this lib's symbols + ptr/toArrayBuffer are bound to, captured at construction.
+  // `activate()` re-applies it so multiple wasm renderers can coexist in one isolate (see ffi.ts).
+  private readonly _backend: BackendHandle = captureBackend()
+  activate(): void {
+    activateBackend(this._backend)
+  }
+
+  // The activating Proxy wrapping this instance (set by createRenderLib). JS wrappers built by the
+  // factory methods below (OptimizedBuffer/TextBuffer) must hold the proxy — not the raw `this` —
+  // so their own native ops re-activate this backend. Falls back to `this` on the native path.
+  _self?: RenderLib
+  private self(): RenderLib {
+    return this._self ?? (this as unknown as RenderLib)
+  }
+
   constructor(libPath?: string) {
     this.opentui = getOpenTUILib(libPath)
     try {
@@ -2791,7 +2811,7 @@ class FFIRenderLib implements RenderLib {
     const width = this.opentui.symbols.getBufferWidth(bufferPtr)
     const height = this.opentui.symbols.getBufferHeight(bufferPtr)
 
-    return new OptimizedBuffer(this, bufferPtr, width, height, { id: "next buffer", widthMethod: "unicode" })
+    return new OptimizedBuffer(this.self(), bufferPtr, width, height, { id: "next buffer", widthMethod: "unicode" })
   }
 
   public getCurrentBuffer(renderer: Pointer): OptimizedBuffer {
@@ -2803,7 +2823,7 @@ class FFIRenderLib implements RenderLib {
     const width = this.opentui.symbols.getBufferWidth(bufferPtr)
     const height = this.opentui.symbols.getBufferHeight(bufferPtr)
 
-    return new OptimizedBuffer(this, bufferPtr, width, height, { id: "current buffer", widthMethod: "unicode" })
+    return new OptimizedBuffer(this.self(), bufferPtr, width, height, { id: "current buffer", widthMethod: "unicode" })
   }
 
   public rendererSetPaletteState(
@@ -3266,7 +3286,7 @@ class FFIRenderLib implements RenderLib {
       throw new Error(`Failed to create optimized buffer: ${width}x${height}`)
     }
 
-    return new OptimizedBuffer(this, bufferPtr, width, height, { respectAlpha, id, widthMethod })
+    return new OptimizedBuffer(this.self(), bufferPtr, width, height, { respectAlpha, id, widthMethod })
   }
 
   public destroyOptimizedBuffer(bufferPtr: Pointer) {
@@ -3668,7 +3688,7 @@ class FFIRenderLib implements RenderLib {
       throw new Error(`Failed to create TextBuffer`)
     }
 
-    return new TextBuffer(this, bufferPtr)
+    return new TextBuffer(this.self(), bufferPtr)
   }
 
   public destroyTextBuffer(buffer: Pointer): void {
@@ -3773,6 +3793,35 @@ class FFIRenderLib implements RenderLib {
   ): void {
     if (chunks.length === 0) {
       this.textBufferClear(buffer)
+      return
+    }
+
+    if (isWasmBackend()) {
+      // bun-ffi-structs packs char* data via bun's ptr() (JS memory). On wasm the nested text/link
+      // bytes must live in linear memory, so pack the struct manually using the swappable ptr().
+      const size = StyledChunkStruct.size
+      const buf = new ArrayBuffer(size * chunks.length)
+      const dv = new DataView(buf)
+      for (let i = 0; i < chunks.length; i++) {
+        const c = chunks[i]
+        const o = i * size
+        const textBytes = this.encoder.encode(c.text)
+        dv.setBigUint64(o, BigInt(Number(ptr(textBytes))), true)
+        dv.setBigUint64(o + 8, BigInt(textBytes.length), true)
+        dv.setBigUint64(o + 16, c.fg ? BigInt(Number(ptr(c.fg.buffer))) : 0n, true)
+        dv.setBigUint64(o + 24, c.bg ? BigInt(Number(ptr(c.bg.buffer))) : 0n, true)
+        dv.setUint32(o + 32, c.attributes ?? 0, true)
+        const url = c.link?.url
+        if (url) {
+          const linkBytes = this.encoder.encode(url)
+          dv.setBigUint64(o + 40, BigInt(Number(ptr(linkBytes))), true)
+          dv.setBigUint64(o + 48, BigInt(linkBytes.length), true)
+        } else {
+          dv.setBigUint64(o + 40, 0n, true)
+          dv.setBigUint64(o + 48, 0n, true)
+        }
+      }
+      this.opentui.symbols.textBufferSetStyledText(buffer, ptr(new Uint8Array(buf)), chunks.length)
       return
     }
 
@@ -4701,6 +4750,10 @@ class FFIRenderLib implements RenderLib {
     const capsBuffer = new ArrayBuffer(TerminalCapabilitiesStruct.size)
     this.opentui.symbols.getTerminalCapabilities(renderer, ptr(capsBuffer))
 
+    if (isWasmBackend()) {
+      return this.unpackCapabilitiesWasm(capsBuffer)
+    }
+
     const caps = TerminalCapabilitiesStruct.unpack(capsBuffer)
 
     return {
@@ -4727,6 +4780,57 @@ class FFIRenderLib implements RenderLib {
         name: caps.term_name ?? "",
         version: caps.term_version ?? "",
         from_xtversion: caps.term_from_xtversion,
+      },
+    }
+  }
+
+  // Read the capabilities struct without bun-ffi-structs' char* path, whose baked toArrayBuffer
+  // (bun:ffi/node:ffi) is unavailable in workerd. Scalars come from the DataView at the struct's
+  // own field offsets; the char* term name/version are read from linear memory via the swappable
+  // toArrayBuffer. Relies on the Zig struct's pointer/length fields being u64 (pointerSize=8).
+  private unpackCapabilitiesWasm(capsBuffer: ArrayBuffer): TerminalCapabilities {
+    const dv = new DataView(capsBuffer)
+    const layout = TerminalCapabilitiesStruct.layoutByName
+    const off = (name: string): number => {
+      const field = layout.get(name)
+      if (!field) throw new Error(`TerminalCapabilities layout missing field: ${name}`)
+      return field.offset
+    }
+    const bool = (name: string): boolean => dv.getUint8(off(name)) !== 0
+    const u8 = (name: string): number => dv.getUint8(off(name))
+    const cstr = (ptrField: string, lenField: string): string => {
+      const ptrVal = Number(dv.getBigUint64(off(ptrField), true))
+      const len = Number(dv.getBigUint64(off(lenField), true))
+      if (ptrVal === 0 || len === 0) return ""
+      return this.decoder.decode(new Uint8Array(toArrayBuffer(ptrVal as Pointer, 0, len)))
+    }
+
+    const MULTIPLEXERS = ["none", "tmux", "zellij", "screen", "unknown"] as const
+
+    return {
+      kitty_keyboard: bool("kitty_keyboard"),
+      kitty_graphics: bool("kitty_graphics"),
+      rgb: bool("rgb"),
+      ansi256: bool("ansi256"),
+      unicode: u8("unicode") === 1 ? "unicode" : "wcwidth",
+      sgr_pixels: bool("sgr_pixels"),
+      color_scheme_updates: bool("color_scheme_updates"),
+      explicit_width: bool("explicit_width"),
+      scaled_text: bool("scaled_text"),
+      sixel: bool("sixel"),
+      focus_tracking: bool("focus_tracking"),
+      sync: bool("sync"),
+      bracketed_paste: bool("bracketed_paste"),
+      hyperlinks: bool("hyperlinks"),
+      osc52: bool("osc52"),
+      notifications: bool("notifications"),
+      explicit_cursor_positioning: bool("explicit_cursor_positioning"),
+      remote: bool("remote"),
+      multiplexer: MULTIPLEXERS[u8("multiplexer")] ?? "unknown",
+      terminal: {
+        name: cstr("term_name", "term_name_len"),
+        version: cstr("term_version", "term_version_len"),
+        from_xtversion: bool("term_from_xtversion"),
       },
     }
   }
@@ -5121,6 +5225,12 @@ let opentuiLibPath: string | undefined
 let opentuiLib: RenderLib | undefined
 let renderLibResolved = false
 
+// The instance-scoped render lib that is "active" right now. Set by createRenderLib() and re-asserted
+// by its proxy before every call, so the native-object factories (TextBuffer, OptimizedBuffer, Yoga,
+// …) that resolve their lib via resolveRenderLib() transparently get the renderer currently executing
+// — one per Durable Object room. Stays undefined on the single-global native default path.
+let activeRenderLib: RenderLib | undefined
+
 export function setRenderLibPath(libPath: string) {
   if (opentuiLibPath !== libPath) {
     if (renderLibResolved) {
@@ -5134,7 +5244,27 @@ export function setRenderLibPath(libPath: string) {
   }
 }
 
+/**
+ * Inject a pre-built RenderLib (e.g. the WASM runtime from `@opentui/wasm`) so that
+ * `resolveRenderLib()` and every consumer (renderer, NativeSpanFeed, yoga, text-buffer)
+ * use it instead of the native bun:ffi/node:ffi backend. Must be called before the first
+ * `resolveRenderLib()` (i.e. before `createCliRenderer()`). Native default is unchanged when
+ * this is never called.
+ */
+export function setRenderLib(lib: RenderLib): void {
+  if (renderLibResolved && opentuiLib !== lib) {
+    throw new Error("setRenderLib() must be called before resolveRenderLib()")
+  }
+  if (opentuiLib instanceof FFIRenderLib && opentuiLib !== lib) {
+    opentuiLib.dispose()
+  }
+  opentuiLib = lib
+}
+
 export function resolveRenderLib(): RenderLib {
+  // Prefer the active instance-scoped lib (multi-renderer path) so renderables/buffers bind to the
+  // renderer currently executing rather than a process-global singleton.
+  if (activeRenderLib) return activeRenderLib
   if (!opentuiLib) {
     try {
       opentuiLib = new FFIRenderLib(opentuiLibPath)
@@ -5148,7 +5278,28 @@ export function resolveRenderLib(): RenderLib {
   return opentuiLib
 }
 
-// Try eager loading
-try {
-  opentuiLib = new FFIRenderLib(opentuiLibPath)
-} catch (error) {}
+// Build a fresh, self-contained RenderLib over whatever FFI backend is active right now (set via
+// setFfiBackend immediately before). Unlike resolveRenderLib() this bypasses the global singleton,
+// so multiple renderers (e.g. one per Durable Object room) coexist in a single isolate. The returned
+// proxy re-activates its own backend AND marks itself the active lib before every method call, so
+// native-object factories invoked during that call (which read resolveRenderLib()) bind to it too.
+export function createRenderLib(libPath?: string): RenderLib {
+  const lib = new FFIRenderLib(libPath)
+  const proxy = new Proxy(lib, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver)
+      if (typeof value !== "function") return value
+      return (...args: unknown[]) => {
+        target.activate()
+        activeRenderLib = proxy
+        return (value as (...a: unknown[]) => unknown).apply(target, args)
+      }
+    },
+  }) as unknown as RenderLib
+  ;(lib as unknown as { _self?: RenderLib })._self = proxy // factory methods hand wrappers the proxy
+  activeRenderLib = proxy // active from creation, so renderables built before the first render bind here
+  return proxy
+}
+
+// Native lib resolution is fully lazy via resolveRenderLib() — no eager load (it would attempt a
+// native dlopen at import time, which is wasteful on native and unsafe in workerd/browser).

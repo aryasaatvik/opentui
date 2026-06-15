@@ -150,57 +150,26 @@ async function downloadAndCombineQueries(
 }
 
 async function generateDefaultParsersFile(parsers: GeneratedParser[], outputPath: string): Promise<void> {
-  const assetPaths = parsers
-    .map((parser) => {
-      const safeFiletype = parser.filetype.replace(/[^a-zA-Z0-9]/g, "_")
-      const lines = [
-        `const ${safeFiletype}_highlights = await resolveBundledFilePath(`,
-        `  () => import("${parser.highlightsPath}" as string, { with: { type: "file" } }),`,
-        `  "${parser.highlightsPath}",`,
-        `  import.meta.url,`,
-        `)`,
-        `const ${safeFiletype}_language = await resolveBundledFilePath(`,
-        `  () => import("${parser.languagePath}" as string, { with: { type: "file" } }),`,
-        `  "${parser.languagePath}",`,
-        `  import.meta.url,`,
-        `)`,
-      ]
-
-      if (parser.injectionsPath) {
-        lines.push(
-          `const ${safeFiletype}_injections = await resolveBundledFilePath(`,
-          `  () => import("${parser.injectionsPath}" as string, { with: { type: "file" } }),`,
-          `  "${parser.injectionsPath}",`,
-          `  import.meta.url,`,
-          `)`,
-        )
-      }
-
-      return lines.join("\n")
-    })
-    .join("\n")
-
   const parserDefinitions = parsers
     .map((parser) => {
-      const safeFiletype = parser.filetype.replace(/[^a-zA-Z0-9]/g, "_")
-      const queriesLines = [`          highlights: [${safeFiletype}_highlights],`]
+      const queriesLines = [`        highlights: [asset("${parser.highlightsPath}")],`]
 
       if (parser.injectionsPath) {
-        queriesLines.push(`          injections: [${safeFiletype}_injections],`)
+        queriesLines.push(`        injections: [asset("${parser.injectionsPath}")],`)
       }
 
       const injectionMappingLine = parser.injectionMapping
-        ? `        injectionMapping: ${JSON.stringify(parser.injectionMapping, null, 10)},`
+        ? `      injectionMapping: ${JSON.stringify(parser.injectionMapping, null, 6)},`
         : ""
-      const aliasesLine = parser.aliases?.length ? `        aliases: ${JSON.stringify(parser.aliases)},` : ""
+      const aliasesLine = parser.aliases?.length ? `      aliases: ${JSON.stringify(parser.aliases)},` : ""
 
-      return `      {
-        filetype: "${parser.filetype}",
-${aliasesLine ? aliasesLine + "\n" : ""}        queries: {
+      return `    {
+      filetype: "${parser.filetype}",
+${aliasesLine ? aliasesLine + "\n" : ""}      queries: {
 ${queriesLines.join("\n")}
-        },
-        wasm: ${safeFiletype}_language,${injectionMappingLine ? "\n" + injectionMappingLine : ""}
-      }`
+      },
+      wasm: asset("${parser.languagePath}"),${injectionMappingLine ? "\n" + injectionMappingLine : ""}
+    }`
     })
     .join(",\n")
 
@@ -209,9 +178,14 @@ ${queriesLines.join("\n")}
 // Last generated: ${new Date().toISOString()}
 
 import type { FiletypeParserOptions } from "./types.js"
-import { resolveBundledFilePath } from "../../platform/runtime.js"
 
-// Cached parsers to avoid re-resolving paths on every call
+// new URL(rel, import.meta.url) is the portable asset-reference primitive: every bundler emits the
+// referenced file and rewrites the URL instead of parsing it as JS, so the .scm/.wasm assets stay
+// bundler-portable. Native runtimes get a file:// URL the parser worker reads; browser/worker bundles
+// get an emitted asset URL the worker fetches.
+const asset = (rel: string): string => new URL(rel, import.meta.url).href
+
+// Cached parsers to avoid re-resolving on every call
 let _cachedParsers: Promise<FiletypeParserOptions[]> | undefined
 
 export function getParsers(): Promise<FiletypeParserOptions[]> {
@@ -222,8 +196,6 @@ export function getParsers(): Promise<FiletypeParserOptions[]> {
 }
 
 async function loadParsers(): Promise<FiletypeParserOptions[]> {
-${assetPaths}
-
   return [
 ${parserDefinitions},
   ]
@@ -290,6 +262,13 @@ async function main(options?: Partial<UpdateOptions>): Promise<void> {
 
       console.log(`  ✓ Completed ${parser.filetype}`)
     }
+
+    // Vendor the web-tree-sitter runtime wasm so the parser worker can load it via
+    // new URL("./assets/tree-sitter.wasm", import.meta.url) — portable across every bundler.
+    console.log("Vendoring web-tree-sitter runtime wasm...")
+    const { fileURLToPath } = await import("node:url")
+    const runtimeWasmSrc = fileURLToPath(import.meta.resolve("web-tree-sitter/tree-sitter.wasm"))
+    await writeFile(path.join(opts.assetsDir, "tree-sitter.wasm"), await readFile(runtimeWasmSrc))
 
     console.log("Generating output file...")
     await generateDefaultParsersFile(generatedParsers, opts.outputPath)

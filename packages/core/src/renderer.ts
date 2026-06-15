@@ -98,6 +98,11 @@ registerEnvVar({
 })
 
 export interface CliRendererConfig {
+  // Render library this renderer drives. Defaults to the process-global one (resolveRenderLib()).
+  // Pass an explicit, instance-scoped lib (e.g. from @opentui/wasm's createWasmRenderLib) to run
+  // multiple independent renderers in one isolate — one per Durable Object room.
+  renderLib?: RenderLib
+
   // Read input from this stream. Defaults to process.stdin. Any `Readable`
   // works; capabilities like `setRawMode` are duck-typed and used when present.
   stdin?: NodeJS.ReadStream
@@ -1000,7 +1005,7 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     this._usesProcessStdout = stdout === process.stdout
     this.realStdoutWrite = stdout.write
 
-    const lib = resolveRenderLib()
+    const lib = config.renderLib ?? resolveRenderLib()
     const useMemoryBufferedOutput = config.bufferedOutput === "memory"
     const useFeedOutput = !this._usesProcessStdout && !useMemoryBufferedOutput
     const { screenMode, footerHeight, externalOutputMode } = resolveModes(config)
@@ -1020,7 +1025,7 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     let feed: NativeSpanFeed | null = null
     if (useFeedOutput) {
       try {
-        feed = NativeSpanFeed.create()
+        feed = NativeSpanFeed.create(undefined, lib)
       } catch (error) {
         throw new Error(
           `Failed to allocate NativeSpanFeed for custom stdout: ${error instanceof Error ? error.message : String(error)}`,
@@ -4370,9 +4375,34 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     this.loop()
   }
 
+  /**
+   * Render exactly one frame on demand, without starting the continuous loop. Output is emitted via
+   * the configured stdout/feed during the render. Intended for server-driven renderers (e.g. a
+   * Durable Object) that render per event rather than running a continuous loop.
+   */
+  public async renderOnce(): Promise<void> {
+    if (this._isDestroyed) return
+    await this.loop()
+  }
+
+  /**
+   * Render one frame as a FULL repaint (not a diff), on demand. For server-driven renderers that
+   * fan one render out to many viewers (e.g. a shared Durable Object room): a full frame is complete
+   * for any client, including one that just joined mid-session.
+   */
+  public async renderFull(): Promise<void> {
+    if (this._isDestroyed) return
+    this.forceFullRepaintRequested = true
+    await this.loop()
+  }
+
   private async loop(): Promise<void> {
     if (this.rendering || this._isDestroyed) return
     this.renderTimeout = null
+
+    // Bind this renderer's FFI backend as active before any renderable/buffer native op this frame.
+    // Required when multiple instance-scoped renderers share an isolate (one per Durable Object room).
+    this.lib.activate?.()
 
     this.rendering = true
     if (this.renderTimeout) {
